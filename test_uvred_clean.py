@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Use the WORKING rebuild code (from test_all_red.py) but with UV-masked textures
-instead of solid red. If this works → redact.py's rebuild has a bug.
-If this fails → the texture content itself is the problem."""
+"""SLPK texture redaction with 3D voxel-based pixelation.
+
+Redaction colors are defined in a 3D voxel grid (world space), ensuring:
+- Seamless across UV atlas seams (same world position → same color)
+- Seamless across LOD transitions (all LODs sample the same grid)
+- No mixing of surfaces at different heights (3D grid, not 2D)
+"""
 
 import gzip
 import hashlib
@@ -14,16 +18,19 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from pyproj import Transformer
+from scipy.ndimage import binary_dilation, gaussian_filter
 from shapely.geometry import Polygon, Point, box, shape
 from shapely.prepared import prep
+from shapely.strtree import STRtree
 
 SLPK = "/home/sbk-usr/mesh-redaction/Stockholm_3D_2025_North.slpk"
 OUTPUT = "/home/sbk-usr/mesh-redaction/test_uvred_clean.slpk"
+VOXEL_SIZE = 2.0  # meters per voxel cell
+BLUR_SIGMA = 1.5  # voxel cells
 
 
 def _bary_uv(px, py, uv_a, uv_b, uv_c):
-    """Barycentric coords of (px,py) within UV triangle (uv_a, uv_b, uv_c).
-    UV space is always a well-conditioned 2D triangle."""
+    """Barycentric coords of (px,py) within UV triangle (uv_a, uv_b, uv_c)."""
     d00 = (uv_b[0]-uv_a[0])**2 + (uv_b[1]-uv_a[1])**2
     d01 = (uv_b[0]-uv_a[0])*(uv_c[0]-uv_a[0]) + (uv_b[1]-uv_a[1])*(uv_c[1]-uv_a[1])
     d11 = (uv_c[0]-uv_a[0])**2 + (uv_c[1]-uv_a[1])**2
@@ -31,22 +38,38 @@ def _bary_uv(px, py, uv_a, uv_b, uv_c):
     d21 = (px-uv_a[0])*(uv_c[0]-uv_a[0]) + (py-uv_a[1])*(uv_c[1]-uv_a[1])
     denom = d00*d11 - d01*d01
     if abs(denom) < 1e-12:
-        return -1, -1, -1  # degenerate UV triangle
+        return -1, -1, -1
     v = (d11*d20 - d01*d21) / denom
     w = (d00*d21 - d01*d20) / denom
-    u = 1 - v - w
-    return u, v, w
+    return 1-v-w, v, w
+
+
+def parse_geometry(zf, res_id):
+    """Parse geometry buffer, return (positions, uv0, file_vc) or None."""
+    gdata = gzip.decompress(zf.read(f"nodes/{res_id}/geometries/0.bin.gz"))
+    if len(gdata) < 8:
+        return None
+    file_vc = struct.unpack_from("<I", gdata, 0)[0]
+    if file_vc == 0:
+        return None
+    off = 8
+    pos_size = file_vc * 3 * 4
+    if off + pos_size > len(gdata):
+        return None
+    positions = np.frombuffer(gdata, dtype=np.float32, count=file_vc*3, offset=off).reshape(-1, 3)
+    off += pos_size + file_vc * 3 * 4  # skip normals
+    uv_size = file_vc * 2 * 4
+    if off + uv_size > len(gdata):
+        return None
+    uv0 = np.frombuffer(gdata, dtype=np.float32, count=file_vc*2, offset=off).reshape(-1, 2)
+    return positions, uv0, file_vc
 
 
 def main():
-    print("=== UV-Masked Red (Clean Rebuild) ===")
+    print("=== Voxel-Based Redaction ===")
 
     zipfile.ZipExtFile._update_crc = lambda self, data: None
     zf = zipfile.ZipFile(SLPK, "r")
-
-    # Load layer info
-    layer = json.loads(gzip.decompress(zf.read("3dSceneLayer.json.gz")))
-    has_color = "color" in layer["store"]["defaultGeometrySchema"]["vertexAttributes"]
 
     # Load polygon
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:3011", always_xy=True)
@@ -55,9 +78,10 @@ def main():
     geom = shape(gj["features"][0]["geometry"])
     coords = [transformer.transform(lon, lat) for lon, lat in geom.exterior.coords]
     poly = Polygon(coords)
+    prep_p = prep(poly)
     print(f"Polygon bounds: {poly.bounds}")
 
-    # Find ALL candidates from node pages
+    # Find candidates from node pages, separate leaves from interior
     page_names = sorted(
         [n for n in zf.namelist() if n.startswith("nodepages/") and n.endswith(".json.gz")],
         key=lambda x: int(x.split("/")[1].split(".")[0]),
@@ -71,18 +95,124 @@ def main():
             obb = node["obb"]
             cx, cy = obb["center"][0], obb["center"][1]
             hx, hy = obb["halfSize"][0], obb["halfSize"][1]
-            node_box = box(cx - hx, cy - hy, cx + hx, cy + hy)
-            if node_box.intersects(poly):
-                candidates.append(node)
+            if box(cx-hx, cy-hy, cx+hx, cy+hy).intersects(poly):
+                is_leaf = len(node.get("children", [])) == 0
+                candidates.append((node, is_leaf))
 
-    print(f"Candidates: {len(candidates)}")
+    leaves = [(n, l) for n, l in candidates if l]
+    print(f"Candidates: {len(candidates)} ({len(leaves)} leaves)")
 
-    # Process each candidate — UV masking with red fill
+    # ================================================================
+    # PHASE 1: Build 3D voxel grid from leaf nodes
+    # ================================================================
+    print("\nPhase 1: Building voxel grid from leaf textures...")
+
+    # Grid bounds from polygon + buffer
+    bx0, by0, bx1, by1 = poly.bounds
+    BUFFER = 10.0
+    # Z range: scan leaf geometry to find min/max Z
+    z_min, z_max = 1e9, -1e9
+    for node, _ in leaves:
+        res_id = node["mesh"]["material"]["resource"]
+        result = parse_geometry(zf, res_id)
+        if result is None:
+            continue
+        positions, _, _ = result
+        obb_center = node["obb"]["center"]
+        world_z = positions[:, 2] + obb_center[2]
+        z_min = min(z_min, world_z.min())
+        z_max = max(z_max, world_z.max())
+
+    grid_origin = np.array([bx0 - BUFFER, by0 - BUFFER, z_min - BUFFER])
+    grid_size = np.array([
+        int(np.ceil((bx1 + BUFFER - grid_origin[0]) / VOXEL_SIZE)) + 1,
+        int(np.ceil((by1 + BUFFER - grid_origin[1]) / VOXEL_SIZE)) + 1,
+        int(np.ceil((z_max + BUFFER - grid_origin[2]) / VOXEL_SIZE)) + 1,
+    ])
+    print(f"  Grid: {grid_size[0]}x{grid_size[1]}x{grid_size[2]} = {np.prod(grid_size)} voxels")
+    print(f"  Origin: ({grid_origin[0]:.0f}, {grid_origin[1]:.0f}, {grid_origin[2]:.0f})")
+
+    # Accumulation arrays
+    color_sum = np.zeros((*grid_size, 3), dtype=np.float64)
+    color_count = np.zeros(grid_size, dtype=np.int32)
+
+    # Fill voxels from leaf node vertices
+    for node, _ in leaves:
+        res_id = node["mesh"]["material"]["resource"]
+        result = parse_geometry(zf, res_id)
+        if result is None:
+            continue
+        positions, uv0, file_vc = result
+        obb_center = node["obb"]["center"]
+
+        pos_world = positions.copy()
+        pos_world[:, 0] += obb_center[0]
+        pos_world[:, 1] += obb_center[1]
+        pos_world[:, 2] += obb_center[2]
+
+        # Load texture
+        tex_data = zf.read(f"nodes/{res_id}/textures/0.jpg")
+        tex = Image.open(io.BytesIO(tex_data))
+        tex_np = np.array(tex)
+        tw, th = tex.size
+
+        # For each vertex inside polygon, sample texture and accumulate
+        for vi in range(file_vc):
+            wx, wy, wz = pos_world[vi]
+            if not prep_p.contains(Point(wx, wy)):
+                continue
+
+            # Sample texture at vertex UV
+            u, v = uv0[vi]
+            px = int(np.clip(u * tw, 0, tw - 1))
+            py = int(np.clip(v * th, 0, th - 1))
+            color = tex_np[py, px, :3].astype(np.float64)
+
+            # Voxel cell
+            gi = int((wx - grid_origin[0]) / VOXEL_SIZE)
+            gj = int((wy - grid_origin[1]) / VOXEL_SIZE)
+            gk = int((wz - grid_origin[2]) / VOXEL_SIZE)
+            if 0 <= gi < grid_size[0] and 0 <= gj < grid_size[1] and 0 <= gk < grid_size[2]:
+                color_sum[gi, gj, gk] += color
+                color_count[gi, gj, gk] += 1
+
+    # Average
+    occupied = color_count > 0
+    print(f"  Occupied voxels: {np.sum(occupied)} ({100*np.sum(occupied)/np.prod(grid_size):.2f}%)")
+    voxel_color = np.zeros_like(color_sum)
+    for c in range(3):
+        voxel_color[:, :, :, c] = np.where(occupied, color_sum[:, :, :, c] / color_count, 0)
+
+    # ================================================================
+    # PHASE 2: Blur voxel grid (3D Gaussian, only through occupied cells)
+    # ================================================================
+    print("\nPhase 2: Blurring voxel grid...")
+
+    # Gaussian blur each color channel, masked to occupied voxels
+    # Use a weighted blur: blur(color * occupied) / blur(occupied) to avoid
+    # pulling in zeros from empty space
+    occupied_f = occupied.astype(np.float64)
+    weight = gaussian_filter(occupied_f, sigma=BLUR_SIGMA)
+    weight = np.maximum(weight, 1e-10)  # avoid division by zero
+
+    blurred_color = np.zeros_like(voxel_color)
+    for c in range(3):
+        blurred_color[:, :, :, c] = gaussian_filter(
+            voxel_color[:, :, :, c] * occupied_f, sigma=BLUR_SIGMA
+        ) / weight
+
+    print(f"  Blur sigma: {BLUR_SIGMA} cells ({BLUR_SIGMA * VOXEL_SIZE:.1f}m)")
+
+    # ================================================================
+    # PHASE 3: Paint all LOD levels using voxel grid
+    # ================================================================
+    print(f"\nPhase 3: Painting {len(candidates)} nodes...")
+
     replace_paths = {}
     seen = set()
     redacted = 0
 
-    for node in candidates:
+    for node, is_leaf in candidates:
         res_id = node["mesh"]["material"]["resource"]
         if res_id in seen:
             continue
@@ -90,74 +220,40 @@ def main():
 
         tex_path = f"nodes/{res_id}/textures/0.jpg"
         geom_path = f"nodes/{res_id}/geometries/0.bin.gz"
-
         try:
             zf.getinfo(tex_path)
             zf.getinfo(geom_path)
         except KeyError:
             continue
 
-        # Parse geometry (full header_vc)
-        gdata = gzip.decompress(zf.read(geom_path))
-        if len(gdata) < 8:
+        result = parse_geometry(zf, res_id)
+        if result is None:
             continue
-        file_vc = struct.unpack_from("<I", gdata, 0)[0]
-        if file_vc == 0:
-            continue
+        positions, uv0, file_vc = result
 
-        offset = 8
-        pos_size = file_vc * 3 * 4
-        if offset + pos_size > len(gdata):
-            continue
-        positions = np.frombuffer(gdata, dtype=np.float32, count=file_vc * 3, offset=offset).reshape(-1, 3)
-        offset += pos_size
-        offset += file_vc * 3 * 4  # normals
-        uv_size = file_vc * 2 * 4
-        if offset + uv_size > len(gdata):
-            continue
-        uv0 = np.frombuffer(gdata, dtype=np.float32, count=file_vc * 2, offset=offset).reshape(-1, 2)
-
-        # World positions
         obb_center = node["obb"]["center"]
         pos_world = positions.copy()
         pos_world[:, 0] += obb_center[0]
         pos_world[:, 1] += obb_center[1]
         pos_world[:, 2] += obb_center[2]
 
-        # Find triangles to mask
         num_tri = file_vc // 3
         tri_pos = pos_world.reshape(num_tri, 3, 3)
-        prep_p = prep(poly)
 
-        # Vertex containment: vectorized check for all vertices
+        # Vertex containment
         vertex_inside = np.array([
             prep_p.contains(Point(pos_world[i, 0], pos_world[i, 1]))
             for i in range(file_vc)
         ])
-        # Per-triangle: how many vertices inside?
         tri_inside = vertex_inside.reshape(num_tri, 3).sum(axis=1)
 
-        # Load texture early — needed for per-pixel boundary approach
-        tex_data = zf.read(tex_path)
-        texture = Image.open(io.BytesIO(tex_data))
-        tex_w, tex_h = texture.size
-
-        mask = Image.new("L", (tex_w, tex_h), 0)
-        draw = ImageDraw.Draw(mask)
-        mask_np = np.zeros((tex_h, tex_w), dtype=np.uint8)
-
-        n_full = 0
-        n_boundary = 0
-
-        # Also find triangles with 0 vertices inside but that still intersect
-        # (large triangles straddling the polygon boundary)
-        from shapely.strtree import STRtree
+        # Straddle detection for large boundary triangles
         straddle_set = set()
         tri_polys_2d = []
         tri_polys_idx = []
         for i in range(num_tri):
             if tri_inside[i] > 0:
-                continue  # already handled
+                continue
             v0, v1, v2 = tri_pos[i, 0, :2], tri_pos[i, 1, :2], tri_pos[i, 2, :2]
             try:
                 tp = Polygon([v0, v1, v2])
@@ -172,6 +268,22 @@ def main():
                 if poly.intersects(tri_polys_2d[hit_idx]):
                     straddle_set.add(tri_polys_idx[hit_idx])
 
+        # Load texture
+        tex_data = zf.read(tex_path)
+        texture = Image.open(io.BytesIO(tex_data))
+        tex_w, tex_h = texture.size
+        tex_np = np.array(texture)
+
+        # Build mask and color map simultaneously
+        mask = Image.new("L", (tex_w, tex_h), 0)
+        draw = ImageDraw.Draw(mask)
+        # Per-pixel color from voxel grid (for boundary triangles)
+        voxel_tex = np.zeros_like(tex_np, dtype=np.float64)
+        voxel_mask = np.zeros((tex_h, tex_w), dtype=np.uint8)
+
+        n_full = 0
+        n_boundary = 0
+
         for i in range(num_tri):
             n_in = tri_inside[i]
             if n_in == 0 and i not in straddle_set:
@@ -180,60 +292,111 @@ def main():
             uv_a, uv_b, uv_c = uv0[3*i], uv0[3*i+1], uv0[3*i+2]
 
             if n_in == 3:
-                # All vertices inside polygon → paint full UV triangle
+                # Full triangle: rasterize for mask, sample voxel at vertices
                 pts = [(uv_a[0]*tex_w, uv_a[1]*tex_h),
                        (uv_b[0]*tex_w, uv_b[1]*tex_h),
                        (uv_c[0]*tex_w, uv_c[1]*tex_h)]
                 draw.polygon(pts, fill=255)
                 n_full += 1
             else:
-                # Boundary triangle: per-pixel reverse mapping (UV → world)
-                # Compute bounding box in pixel space
+                n_boundary += 1
+
+            # Per-pixel: iterate UV bounding box, map to world, sample voxel
+            us = [uv_a[0], uv_b[0], uv_c[0]]
+            vs = [uv_a[1], uv_b[1], uv_c[1]]
+            px_min = max(0, int(min(us) * tex_w) - 1)
+            px_max = min(tex_w - 1, int(max(us) * tex_w) + 1)
+            py_min = max(0, int(min(vs) * tex_h) - 1)
+            py_max = min(tex_h - 1, int(max(vs) * tex_h) + 1)
+
+            wv0 = tri_pos[i, 0]  # full XYZ
+            wv1 = tri_pos[i, 1]
+            wv2 = tri_pos[i, 2]
+
+            for py in range(py_min, py_max + 1):
+                for px in range(px_min, px_max + 1):
+                    u_coord = (px + 0.5) / tex_w
+                    v_coord = (py + 0.5) / tex_h
+
+                    bu, bv, bw = _bary_uv(u_coord, v_coord, uv_a, uv_b, uv_c)
+                    if bu < -0.001 or bv < -0.001 or bw < -0.001:
+                        continue
+
+                    # World XYZ from barycentric
+                    wx = bu * wv0[0] + bv * wv1[0] + bw * wv2[0]
+                    wy = bu * wv0[1] + bv * wv1[1] + bw * wv2[1]
+                    wz = bu * wv0[2] + bv * wv1[2] + bw * wv2[2]
+
+                    # For boundary triangles, check polygon containment
+                    if n_in < 3 and not prep_p.contains(Point(wx, wy)):
+                        continue
+
+                    # Sample voxel grid
+                    gi = int((wx - grid_origin[0]) / VOXEL_SIZE)
+                    gj_idx = int((wy - grid_origin[1]) / VOXEL_SIZE)
+                    gk = int((wz - grid_origin[2]) / VOXEL_SIZE)
+                    gi = np.clip(gi, 0, grid_size[0] - 1)
+                    gj_idx = np.clip(gj_idx, 0, grid_size[1] - 1)
+                    gk = np.clip(gk, 0, grid_size[2] - 1)
+
+                    voxel_tex[py, px] = blurred_color[gi, gj_idx, gk]
+                    voxel_mask[py, px] = 255
+
+        # Merge: full-triangle mask + per-pixel boundary mask
+        mask_np = np.maximum(np.array(mask), voxel_mask)
+
+        if np.sum(mask_np > 0) == 0:
+            continue
+
+        # For full triangles that weren't per-pixel sampled, fill from voxel grid
+        # using vertex-averaged voxel color (fast approximation)
+        full_only = (np.array(mask) > 0) & (voxel_mask == 0)
+        if np.sum(full_only) > 0:
+            # These pixels need voxel colors but weren't individually sampled.
+            # Sample at triangle centroids for each full triangle and flood fill.
+            # Simpler: iterate full triangles' pixels (already done for boundary,
+            # skip for full to save time — but now we need them).
+            # Re-iterate full triangles for voxel sampling.
+            for i in range(num_tri):
+                if tri_inside[i] != 3:
+                    continue
+                uv_a, uv_b, uv_c = uv0[3*i], uv0[3*i+1], uv0[3*i+2]
+                wv0 = tri_pos[i, 0]
+                wv1 = tri_pos[i, 1]
+                wv2 = tri_pos[i, 2]
+
                 us = [uv_a[0], uv_b[0], uv_c[0]]
-                vs = [uv_a[1], uv_b[1], uv_c[1]]
+                vs_list = [uv_a[1], uv_b[1], uv_c[1]]
                 px_min = max(0, int(min(us) * tex_w) - 1)
                 px_max = min(tex_w - 1, int(max(us) * tex_w) + 1)
-                py_min = max(0, int(min(vs) * tex_h) - 1)
-                py_max = min(tex_h - 1, int(max(vs) * tex_h) + 1)
-
-                # World XY vertices for this triangle
-                wv0 = tri_pos[i, 0, :2]
-                wv1 = tri_pos[i, 1, :2]
-                wv2 = tri_pos[i, 2, :2]
+                py_min = max(0, int(min(vs_list) * tex_h) - 1)
+                py_max = min(tex_h - 1, int(max(vs_list) * tex_h) + 1)
 
                 for py in range(py_min, py_max + 1):
                     for px in range(px_min, px_max + 1):
-                        # Pixel center in UV space
+                        if voxel_mask[py, px] > 0:
+                            continue  # already sampled
+                        if mask_np[py, px] == 0:
+                            continue  # not in mask
+
                         u_coord = (px + 0.5) / tex_w
                         v_coord = (py + 0.5) / tex_h
-
-                        # Barycentric in UV space (always well-conditioned)
                         bu, bv, bw = _bary_uv(u_coord, v_coord, uv_a, uv_b, uv_c)
                         if bu < -0.001 or bv < -0.001 or bw < -0.001:
-                            continue  # outside UV triangle
+                            continue
 
-                        # Map to world XY using same barycentric weights
                         wx = bu * wv0[0] + bv * wv1[0] + bw * wv2[0]
                         wy = bu * wv0[1] + bv * wv1[1] + bw * wv2[1]
+                        wz = bu * wv0[2] + bv * wv1[2] + bw * wv2[2]
 
-                        # Test against polygon
-                        if prep_p.contains(Point(wx, wy)):
-                            mask_np[py, px] = 255
+                        gi = np.clip(int((wx - grid_origin[0]) / VOXEL_SIZE), 0, grid_size[0]-1)
+                        gj_idx = np.clip(int((wy - grid_origin[1]) / VOXEL_SIZE), 0, grid_size[1]-1)
+                        gk = np.clip(int((wz - grid_origin[2]) / VOXEL_SIZE), 0, grid_size[2]-1)
 
-                n_boundary += 1
+                        voxel_tex[py, px] = blurred_color[gi, gj_idx, gk]
+                        voxel_mask[py, px] = 255
 
-        # Merge rasterized full triangles with per-pixel boundary mask
-        mask_np = np.maximum(mask_np, np.array(mask))
-
-        if n_full + n_boundary == 0:
-            continue
-
-        # UV padding: extend mask into dead space by 4px for bilinear + mipmap sampling.
-        # Only expand INTO dead space (pixels not covered by ANY UV triangle),
-        # never into adjacent UV islands.
-        from scipy.ndimage import binary_dilation
-        all_uv_mask = np.array(mask)  # all UV triangles (full node, not just polygon)
-        # Rebuild all-triangles mask to identify dead space
+        # UV padding: extend into dead space
         all_tri_mask = Image.new("L", (tex_w, tex_h), 0)
         all_tri_draw = ImageDraw.Draw(all_tri_mask)
         for ti in range(num_tri):
@@ -242,31 +405,27 @@ def main():
             all_tri_draw.polygon(pts, fill=255)
         dead_space = np.array(all_tri_mask) == 0
 
-        # Dilate the mask, but only allow expansion into dead space
         padded = binary_dilation(mask_np > 0, iterations=4).astype(np.uint8) * 255
-        padded[~dead_space & (mask_np == 0)] = 0  # don't bleed into other UV islands
+        padded[~dead_space & (mask_np == 0)] = 0
+        # For padded pixels, copy nearest voxel color
+        pad_only = (padded > 0) & (voxel_mask == 0)
+        if np.sum(pad_only) > 0:
+            # Simple: dilate the voxel color image to fill padding
+            for c in range(3):
+                chan = voxel_tex[:, :, c].copy()
+                for _ in range(4):
+                    from scipy.ndimage import maximum_filter, minimum_filter
+                    filled = gaussian_filter(chan * (voxel_mask > 0).astype(float), sigma=1)
+                    weight_f = gaussian_filter((voxel_mask > 0).astype(float), sigma=1)
+                    weight_f = np.maximum(weight_f, 1e-10)
+                    chan = np.where(voxel_mask > 0, chan, filled / weight_f)
+                voxel_tex[:, :, c] = chan
+
         mask_np = np.maximum(mask_np, padded)
 
-        print(f"  res={res_id}: {n_full} full + {n_boundary} boundary triangles, "
-              f"{np.sum(mask_np > 0)} masked px")
-
-        # Apply pixelation + blur to masked region
-        tex_np = np.array(texture)
+        # Composite
         mask_bool = mask_np > 0
-
-        # Pixelate: downscale then upscale to create blocky effect
-        pixelate_factor = 16
-        small_w, small_h = max(1, tex_w // pixelate_factor), max(1, tex_h // pixelate_factor)
-        pixelated = texture.resize((small_w, small_h), Image.NEAREST).resize((tex_w, tex_h), Image.NEAREST)
-        pix_np = np.array(pixelated)
-
-        # Gaussian blur the pixelated result for softer appearance
-        from PIL import ImageFilter
-        blurred = Image.fromarray(pix_np).filter(ImageFilter.GaussianBlur(radius=8))
-        blur_np = np.array(blurred)
-
-        # Composite: blurred pixelation in masked region, original elsewhere
-        tex_np[mask_bool] = blur_np[mask_bool]
+        tex_np[mask_bool] = np.clip(voxel_tex[mask_bool], 0, 255).astype(np.uint8)
         result = Image.fromarray(tex_np)
 
         buf = io.BytesIO()
