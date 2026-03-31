@@ -250,12 +250,23 @@ def main():
         print(f"  res={res_id}: {n_full} full + {n_boundary} boundary triangles, "
               f"{np.sum(mask_np > 0)} masked px")
 
-        # Apply red fill to masked region
+        # Apply pixelation + blur to masked region
         tex_np = np.array(texture)
         mask_bool = mask_np > 0
-        tex_np[mask_bool, 0] = 255
-        tex_np[mask_bool, 1] = 0
-        tex_np[mask_bool, 2] = 0
+
+        # Pixelate: downscale then upscale to create blocky effect
+        pixelate_factor = 16
+        small_w, small_h = max(1, tex_w // pixelate_factor), max(1, tex_h // pixelate_factor)
+        pixelated = texture.resize((small_w, small_h), Image.NEAREST).resize((tex_w, tex_h), Image.NEAREST)
+        pix_np = np.array(pixelated)
+
+        # Gaussian blur the pixelated result for softer appearance
+        from PIL import ImageFilter
+        blurred = Image.fromarray(pix_np).filter(ImageFilter.GaussianBlur(radius=8))
+        blur_np = np.array(blurred)
+
+        # Composite: blurred pixelation in masked region, original elsewhere
+        tex_np[mask_bool] = blur_np[mask_bool]
         result = Image.fromarray(tex_np)
 
         buf = io.BytesIO()
