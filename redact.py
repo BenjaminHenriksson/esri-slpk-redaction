@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""SLPK Texture Redaction Pipeline.
+"""SLPK texture redaction with 3D voxel-based pixelation.
 
-Given an SLPK (Integrated Mesh) and redaction polygons (GeoJSON in WGS84),
-pixelate+blur texture regions corresponding to those polygons across all LoD levels.
-
-For debugging: outputs only the region around the redaction polygons (~500m buffer).
+Redaction colors are defined in a 3D voxel grid (world space), ensuring:
+- Seamless across UV atlas seams (same world position → same color)
+- Seamless across LOD transitions (all LODs sample the same grid)
+- No mixing of surfaces at different heights (3D grid, not 2D)
 """
 
 import argparse
@@ -13,505 +13,506 @@ import hashlib
 import io
 import json
 import struct
-import sys
 import zipfile
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 from pyproj import Transformer
-from rtree import index as rtree_index
-from scipy.ndimage import binary_dilation
-from shapely.geometry import Polygon, shape
+from scipy.ndimage import binary_dilation, gaussian_filter
+from shapely.geometry import Polygon, Point, box, shape
 from shapely.prepared import prep
 from shapely.strtree import STRtree
 
+DEFAULT_VOXEL_SIZE = 2.0  # meters per voxel cell
+DEFAULT_BLUR_SIGMA = 1.5  # voxel cells
 
-def load_redaction_polygons(geojson_path: str, transformer: Transformer) -> list[Polygon]:
-    """Load GeoJSON polygons and reproject from WGS84 to the layer CRS."""
-    with open(geojson_path) as f:
+
+def _bary_uv(px, py, uv_a, uv_b, uv_c):
+    """Barycentric coords of (px,py) within UV triangle (uv_a, uv_b, uv_c)."""
+    d00 = (uv_b[0]-uv_a[0])**2 + (uv_b[1]-uv_a[1])**2
+    d01 = (uv_b[0]-uv_a[0])*(uv_c[0]-uv_a[0]) + (uv_b[1]-uv_a[1])*(uv_c[1]-uv_a[1])
+    d11 = (uv_c[0]-uv_a[0])**2 + (uv_c[1]-uv_a[1])**2
+    d20 = (px-uv_a[0])*(uv_b[0]-uv_a[0]) + (py-uv_a[1])*(uv_b[1]-uv_a[1])
+    d21 = (px-uv_a[0])*(uv_c[0]-uv_a[0]) + (py-uv_a[1])*(uv_c[1]-uv_a[1])
+    denom = d00*d11 - d01*d01
+    if abs(denom) < 1e-12:
+        return -1, -1, -1
+    v = (d11*d20 - d01*d21) / denom
+    w = (d00*d21 - d01*d20) / denom
+    return 1-v-w, v, w
+
+
+def parse_geometry(zf, res_id):
+    """Parse geometry buffer, return (positions, uv0, file_vc) or None."""
+    gdata = gzip.decompress(zf.read(f"nodes/{res_id}/geometries/0.bin.gz"))
+    if len(gdata) < 8:
+        return None
+    file_vc = struct.unpack_from("<I", gdata, 0)[0]
+    if file_vc == 0:
+        return None
+    off = 8
+    pos_size = file_vc * 3 * 4
+    if off + pos_size > len(gdata):
+        return None
+    positions = np.frombuffer(gdata, dtype=np.float32, count=file_vc*3, offset=off).reshape(-1, 3)
+    off += pos_size + file_vc * 3 * 4  # skip normals
+    uv_size = file_vc * 2 * 4
+    if off + uv_size > len(gdata):
+        return None
+    uv0 = np.frombuffer(gdata, dtype=np.float32, count=file_vc*2, offset=off).reshape(-1, 2)
+    return positions, uv0, file_vc
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SLPK texture redaction via 3D voxel blur")
+    parser.add_argument("--slpk", required=True, help="Input SLPK file")
+    parser.add_argument("--polygons", required=True, help="GeoJSON redaction polygons")
+    parser.add_argument("--output", required=True, help="Output SLPK file")
+    parser.add_argument("--voxel-size", type=float, default=DEFAULT_VOXEL_SIZE, help="Voxel size in meters (default: 2.0)")
+    parser.add_argument("--blur-sigma", type=float, default=DEFAULT_BLUR_SIGMA, help="Blur sigma in voxel cells (default: 1.5)")
+    args = parser.parse_args()
+
+    voxel_size = args.voxel_size
+    blur_sigma = args.blur_sigma
+
+    print("=== Voxel-Based Redaction ===")
+
+    zipfile.ZipExtFile._update_crc = lambda self, data: None
+    zf = zipfile.ZipFile(args.slpk, "r")
+
+    # Load polygon
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3011", always_xy=True)
+    with open(args.polygons) as f:
         gj = json.load(f)
+    geom = shape(gj["features"][0]["geometry"])
+    coords = [transformer.transform(lon, lat) for lon, lat in geom.exterior.coords]
+    poly = Polygon(coords)
+    prep_p = prep(poly)
+    print(f"Polygon bounds: {poly.bounds}")
 
-    polygons = []
-    for feature in gj["features"]:
-        geom = shape(feature["geometry"])
-        # Reproject each coordinate from WGS84 (lon, lat) to layer CRS
-        if geom.geom_type == "Polygon":
-            coords = []
-            for ring in [geom.exterior] + list(geom.interiors):
-                projected = [transformer.transform(lon, lat) for lon, lat in ring.coords]
-                coords.append(projected)
-            polygons.append(Polygon(coords[0], coords[1:]))
-        elif geom.geom_type == "MultiPolygon":
-            for poly in geom.geoms:
-                coords = []
-                for ring in [poly.exterior] + list(poly.interiors):
-                    projected = [transformer.transform(lon, lat) for lon, lat in ring.coords]
-                    coords.append(projected)
-                polygons.append(Polygon(coords[0], coords[1:]))
-    return polygons
-
-
-def load_node_pages(zf: zipfile.ZipFile) -> list[dict]:
-    """Load all node pages and return a flat list of nodes."""
+    # Find candidates from node pages, separate leaves from interior
     page_names = sorted(
         [n for n in zf.namelist() if n.startswith("nodepages/") and n.endswith(".json.gz")],
         key=lambda x: int(x.split("/")[1].split(".")[0]),
     )
-    all_nodes = []
+    candidates = []
     for pname in page_names:
-        data = gzip.decompress(zf.read(pname))
-        page = json.loads(data)
-        all_nodes.extend(page["nodes"])
-    return all_nodes
+        page = json.loads(gzip.decompress(zf.read(pname)))
+        for node in page["nodes"]:
+            if "obb" not in node or "mesh" not in node:
+                continue
+            obb = node["obb"]
+            cx, cy = obb["center"][0], obb["center"][1]
+            hx, hy = obb["halfSize"][0], obb["halfSize"][1]
+            if box(cx-hx, cy-hy, cx+hx, cy+hy).intersects(poly):
+                is_leaf = len(node.get("children", [])) == 0
+                candidates.append((node, is_leaf))
 
+    leaves = [(n, l) for n, l in candidates if l]
+    print(f"Candidates: {len(candidates)} ({len(leaves)} leaves)")
 
-def build_spatial_index(nodes: list[dict]) -> tuple[rtree_index.Index, dict]:
-    """Build an R-tree spatial index over node OBBs. Returns (rtree, node_index_map)."""
-    idx = rtree_index.Index()
-    node_map = {}  # rtree_id -> node
+    # ================================================================
+    # PHASE 1: Build 3D voxel grid from leaf nodes
+    # ================================================================
+    print("\nPhase 1: Building voxel grid from leaf textures...")
 
-    for i, node in enumerate(nodes):
-        if "obb" not in node:
+    # Grid bounds from polygon + buffer
+    bx0, by0, bx1, by1 = poly.bounds
+    BUFFER = 10.0
+    # Z range: scan leaf geometry to find min/max Z
+    z_min, z_max = 1e9, -1e9
+    for node, _ in leaves:
+        res_id = node["mesh"]["material"]["resource"]
+        result = parse_geometry(zf, res_id)
+        if result is None:
             continue
-        obb = node["obb"]
-        cx, cy, cz = obb["center"]
-        hx, hy, hz = obb["halfSize"]
-        # AABB from OBB (quaternion is identity [0,0,0,1] for all nodes we've seen)
-        minx, miny = cx - hx, cy - hy
-        maxx, maxy = cx + hx, cy + hy
-        idx.insert(i, (minx, miny, maxx, maxy))
-        node_map[i] = node
+        positions, _, _ = result
+        obb_center = node["obb"]["center"]
+        world_z = positions[:, 2] + obb_center[2]
+        z_min = min(z_min, world_z.min())
+        z_max = max(z_max, world_z.max())
 
-    return idx, node_map
+    grid_origin = np.array([bx0 - BUFFER, by0 - BUFFER, z_min - BUFFER])
+    grid_size = np.array([
+        int(np.ceil((bx1 + BUFFER - grid_origin[0]) / voxel_size)) + 1,
+        int(np.ceil((by1 + BUFFER - grid_origin[1]) / voxel_size)) + 1,
+        int(np.ceil((z_max + BUFFER - grid_origin[2]) / voxel_size)) + 1,
+    ])
+    print(f"  Grid: {grid_size[0]}x{grid_size[1]}x{grid_size[2]} = {np.prod(grid_size)} voxels")
+    print(f"  Origin: ({grid_origin[0]:.0f}, {grid_origin[1]:.0f}, {grid_origin[2]:.0f})")
 
+    # Accumulation arrays
+    color_sum = np.zeros((*grid_size, 3), dtype=np.float64)
+    color_count = np.zeros(grid_size, dtype=np.int32)
 
-def find_candidate_nodes(
-    rtree_idx: rtree_index.Index,
-    node_map: dict,
-    polygons: list[Polygon],
-    buffer_m: float,
-) -> set[int]:
-    """Find nodes whose OBB intersects any redaction polygon (with buffer)."""
-    candidates = set()
-    for poly in polygons:
-        bounds = poly.buffer(buffer_m).bounds  # (minx, miny, maxx, maxy)
-        hits = list(rtree_idx.intersection(bounds))
-        candidates.update(hits)
-    return candidates
+    # Fill voxels from leaf node vertices
+    for node, _ in leaves:
+        res_id = node["mesh"]["material"]["resource"]
+        result = parse_geometry(zf, res_id)
+        if result is None:
+            continue
+        positions, uv0, file_vc = result
+        obb_center = node["obb"]["center"]
 
+        pos_world = positions.copy()
+        pos_world[:, 0] += obb_center[0]
+        pos_world[:, 1] += obb_center[1]
+        pos_world[:, 2] += obb_center[2]
 
-def find_region_nodes(
-    rtree_idx: rtree_index.Index,
-    node_map: dict,
-    polygons: list[Polygon],
-    buffer_m: float,
-) -> set[int]:
-    """Find ALL nodes in the ~500m region around the redaction polygons (for output)."""
-    candidates = set()
-    for poly in polygons:
-        bounds = poly.buffer(buffer_m).bounds
-        hits = list(rtree_idx.intersection(bounds))
-        candidates.update(hits)
-    return candidates
+        # Load texture
+        tex_data = zf.read(f"nodes/{res_id}/textures/0.jpg")
+        tex = Image.open(io.BytesIO(tex_data))
+        tex_np = np.array(tex)
+        tw, th = tex.size
 
+        # For each vertex inside polygon, sample texture and accumulate
+        for vi in range(file_vc):
+            wx, wy, wz = pos_world[vi]
+            if not prep_p.contains(Point(wx, wy)):
+                continue
 
-def parse_geometry_buffer(data: bytes, has_color: bool = True) -> dict:
-    """Parse an I3S geometry buffer (uncompressed, post-gzip-decompression).
+            # Sample texture at vertex UV
+            u, v = uv0[vi]
+            px = int(np.clip(u * tw, 0, tw - 1))
+            py = int(np.clip(v * th, 0, th - 1))
+            color = tex_np[py, px, :3].astype(np.float64)
 
-    Layout: [header: vertexCount(U32), featureCount(U32)]
-            [position: F32x3 x vertexCount]
-            [normal: F32x3 x vertexCount]
-            [uv0: F32x2 x vertexCount]
-            [color: U8x4 x vertexCount]  (if present)
-            [featureId: U64 x featureCount]
-            [faceRange: U32x2 x featureCount]
-    """
-    if len(data) < 8:
-        return None
+            # Voxel cell
+            gi = int((wx - grid_origin[0]) / voxel_size)
+            gj = int((wy - grid_origin[1]) / voxel_size)
+            gk = int((wz - grid_origin[2]) / voxel_size)
+            if 0 <= gi < grid_size[0] and 0 <= gj < grid_size[1] and 0 <= gk < grid_size[2]:
+                color_sum[gi, gj, gk] += color
+                color_count[gi, gj, gk] += 1
 
-    vertex_count, feature_count = struct.unpack_from("<II", data, 0)
-    offset = 8
+    # Average
+    occupied = color_count > 0
+    print(f"  Occupied voxels: {np.sum(occupied)} ({100*np.sum(occupied)/np.prod(grid_size):.2f}%)")
+    voxel_color = np.zeros_like(color_sum)
+    for c in range(3):
+        voxel_color[:, :, :, c] = np.where(occupied, color_sum[:, :, :, c] / color_count, 0)
 
-    if vertex_count == 0:
-        return None
+    # ================================================================
+    # PHASE 2: Blur voxel grid (3D Gaussian, only through occupied cells)
+    # ================================================================
+    print("\nPhase 2: Blurring voxel grid...")
 
-    # Position: Float32 x 3
-    pos_size = vertex_count * 3 * 4
-    if offset + pos_size > len(data):
-        return None
-    positions = np.frombuffer(data, dtype=np.float32, count=vertex_count * 3, offset=offset).reshape(-1, 3)
-    offset += pos_size
+    # Gaussian blur each color channel, masked to occupied voxels
+    # Use a weighted blur: blur(color * occupied) / blur(occupied) to avoid
+    # pulling in zeros from empty space
+    occupied_f = occupied.astype(np.float64)
+    weight = gaussian_filter(occupied_f, sigma=blur_sigma)
+    weight = np.maximum(weight, 1e-10)  # avoid division by zero
 
-    # Normal: Float32 x 3
-    norm_size = vertex_count * 3 * 4
-    if offset + norm_size > len(data):
-        return None
-    offset += norm_size  # skip normals, we don't need them
+    blurred_color = np.zeros_like(voxel_color)
+    for c in range(3):
+        blurred_color[:, :, :, c] = gaussian_filter(
+            voxel_color[:, :, :, c] * occupied_f, sigma=blur_sigma
+        ) / weight
 
-    # UV0: Float32 x 2
-    uv_size = vertex_count * 2 * 4
-    if offset + uv_size > len(data):
-        return None
-    uv0 = np.frombuffer(data, dtype=np.float32, count=vertex_count * 2, offset=offset).reshape(-1, 2)
-    offset += uv_size
+    print(f"  Blur sigma: {blur_sigma} cells ({blur_sigma * voxel_size:.1f}m)")
 
-    # Color: UInt8 x 4 (if present)
-    if has_color:
-        color_size = vertex_count * 4
-        if offset + color_size <= len(data):
-            offset += color_size  # skip color
+    # ================================================================
+    # PHASE 3: Paint all LOD levels using voxel grid
+    # ================================================================
+    print(f"\nPhase 3: Painting {len(candidates)} nodes...")
 
-    return {
-        "vertex_count": vertex_count,
-        "feature_count": feature_count,
-        "positions": positions,
-        "uv0": uv0,
-    }
+    replace_paths = {}
+    seen = set()
+    redacted = 0
 
+    for node, is_leaf in candidates:
+        res_id = node["mesh"]["material"]["resource"]
+        if res_id in seen:
+            continue
+        seen.add(res_id)
 
-def find_redaction_triangles(
-    geom: dict,
-    obb_center: list[float],
-    redaction_polys: list[Polygon],
-) -> list[int]:
-    """Find triangle indices that intersect any redaction polygon.
-
-    Returns list of triangle indices (triangle i = vertices [3i, 3i+1, 3i+2]).
-    """
-    positions = geom["positions"].copy()
-    # Transform to global CRS by adding OBB center
-    positions[:, 0] += obb_center[0]
-    positions[:, 1] += obb_center[1]
-    positions[:, 2] += obb_center[2]
-
-    num_triangles = geom["vertex_count"] // 3
-    if num_triangles == 0:
-        return []
-
-    # Build triangle centroids for fast pre-filtering
-    tri_positions = positions.reshape(num_triangles, 3, 3)
-    centroids_2d = tri_positions[:, :, :2].mean(axis=1)  # [N, 2] (x, y)
-
-    # Use STRtree for efficient intersection
-    prepared_polys = [prep(p) for p in redaction_polys]
-
-    # Fast pre-filter: check which centroids are within a generous buffer of any polygon
-    # Then do exact triangle-polygon intersection
-    redaction_tris = []
-
-    # Build shapely triangles for all and use STRtree
-    tri_polys = []
-    tri_indices = []
-    for i in range(num_triangles):
-        v0 = tri_positions[i, 0, :2]
-        v1 = tri_positions[i, 1, :2]
-        v2 = tri_positions[i, 2, :2]
+        tex_path = f"nodes/{res_id}/textures/0.jpg"
+        geom_path = f"nodes/{res_id}/geometries/0.bin.gz"
         try:
-            tp = Polygon([v0, v1, v2])
-            if tp.is_valid and not tp.is_empty:
-                tri_polys.append(tp)
-                tri_indices.append(i)
-        except Exception:
-            continue
-
-    if not tri_polys:
-        return []
-
-    tree = STRtree(tri_polys)
-
-    for rp, prep_rp in zip(redaction_polys, prepared_polys):
-        hits = tree.query(rp)
-        for hit_idx in hits:
-            tri_poly = tri_polys[hit_idx]
-            if prep_rp.intersects(tri_poly):
-                redaction_tris.append(tri_indices[hit_idx])
-
-    return sorted(set(redaction_tris))
-
-
-def build_redaction_mask(
-    redaction_tris: list[int],
-    uv0: np.ndarray,
-    tex_w: int,
-    tex_h: int,
-    dilation_px: int = 3,
-) -> np.ndarray | None:
-    """Build a binary mask at texture resolution from UV-space triangles."""
-    if not redaction_tris:
-        return None
-
-    mask = Image.new("L", (tex_w, tex_h), 0)
-    draw = ImageDraw.Draw(mask)
-
-    for tri_idx in redaction_tris:
-        uv_a = uv0[3 * tri_idx]
-        uv_b = uv0[3 * tri_idx + 1]
-        uv_c = uv0[3 * tri_idx + 2]
-
-        # UV to pixel: u * width, (1-v) * height (V is flipped)
-        pts = [
-            (float(uv_a[0] * tex_w), float((1 - uv_a[1]) * tex_h)),
-            (float(uv_b[0] * tex_w), float((1 - uv_b[1]) * tex_h)),
-            (float(uv_c[0] * tex_w), float((1 - uv_c[1]) * tex_h)),
-        ]
-        draw.polygon(pts, fill=255)
-
-    mask_np = np.array(mask)
-
-    # Dilate to avoid seam artifacts
-    if dilation_px > 0:
-        mask_np = (binary_dilation(mask_np > 0, iterations=dilation_px).astype(np.uint8) * 255)
-
-    return mask_np
-
-
-def apply_pixelate_blur(
-    texture: Image.Image,
-    mask_np: np.ndarray,
-    pixelate_factor: int = 16,
-    blur_radius: int = 8,
-) -> Image.Image:
-    """Apply pixelation then blur to masked region of texture."""
-    tex_np = np.array(texture)
-    tex_w, tex_h = texture.size
-
-    # Pixelate: downscale then upscale
-    small = texture.resize(
-        (max(1, tex_w // pixelate_factor), max(1, tex_h // pixelate_factor)),
-        Image.Resampling.NEAREST,
-    )
-    pixelated = small.resize((tex_w, tex_h), Image.Resampling.NEAREST)
-
-    # Blur the pixelated version
-    blurred = pixelated.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    blurred_np = np.array(blurred)
-
-    # Composite: use mask to blend
-    mask_3ch = np.stack([mask_np] * 3, axis=-1) / 255.0
-    result = (tex_np * (1 - mask_3ch) + blurred_np * mask_3ch).astype(np.uint8)
-
-    return Image.fromarray(result)
-
-
-def regenerate_hash_index(internal_paths: list[str], offsets: dict, sizes: dict) -> bytes:
-    """Regenerate the @specialIndexFileHASH128 / @3dtilesIndex1@ hash index.
-
-    Each entry: MD5(lowercase(path)) → 16-byte key, stored sorted.
-    Record format: [count(U64)] + [key(16B) + offset(U64) + size(U64)] x count
-    """
-    entries = []
-    for path in internal_paths:
-        key = hashlib.md5(path.lower().encode("utf-8")).digest()
-        entries.append((key, offsets[path], sizes[path]))
-
-    entries.sort(key=lambda e: e[0])
-
-    buf = struct.pack("<Q", len(entries))
-    for key, offset, size in entries:
-        buf += key + struct.pack("<QQ", offset, size)
-
-    return buf
-
-
-def main():
-    parser = argparse.ArgumentParser(description="SLPK Texture Redaction")
-    parser.add_argument("--slpk", required=True, help="Input .slpk file")
-    parser.add_argument("--polygons", required=True, help="GeoJSON file with redaction polygons (WGS84)")
-    parser.add_argument("--output", required=True, help="Output .slpk file")
-    parser.add_argument("--buffer", type=float, default=500.0, help="Buffer around polygons for region output (meters)")
-    parser.add_argument("--pixelate-factor", type=int, default=16, help="Pixelation downscale factor")
-    parser.add_argument("--blur-radius", type=int, default=8, help="Gaussian blur radius")
-    parser.add_argument("--dilation", type=int, default=3, help="Mask dilation in pixels")
-    args = parser.parse_args()
-
-    # --- Stage 0: Open SLPK and read metadata ---
-    print("Stage 0: Reading SLPK metadata...")
-    zf = zipfile.ZipFile(args.slpk, "r")
-
-    layer_data = gzip.decompress(zf.read("3dSceneLayer.json.gz"))
-    layer = json.loads(layer_data)
-
-    layer_crs_wkid = layer["spatialReference"]["wkid"]
-    print(f"  Layer CRS: EPSG:{layer_crs_wkid}")
-
-    geom_schema = layer["store"]["defaultGeometrySchema"]
-    has_color = "color" in geom_schema["vertexAttributes"]
-    ordering = geom_schema["ordering"]
-    print(f"  Geometry attributes: {ordering}")
-    print(f"  Texture encoding: {layer['store']['textureEncoding']}")
-
-    # --- Set up CRS transformer (WGS84 → layer CRS) ---
-    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{layer_crs_wkid}", always_xy=True)
-
-    # --- Load redaction polygons ---
-    print(f"  Loading redaction polygons from {args.polygons}...")
-    redaction_polys = load_redaction_polygons(args.polygons, transformer)
-    print(f"  {len(redaction_polys)} redaction polygon(s)")
-
-    for i, p in enumerate(redaction_polys):
-        bounds = p.bounds
-        print(f"    Polygon {i}: bounds ({bounds[0]:.1f}, {bounds[1]:.1f}) - ({bounds[2]:.1f}, {bounds[3]:.1f})")
-
-    # --- Stage 1: Build spatial index ---
-    print("\nStage 1: Loading node pages and building spatial index...")
-    all_nodes = load_node_pages(zf)
-    print(f"  {len(all_nodes)} nodes loaded")
-
-    rtree_idx, node_map = build_spatial_index(all_nodes)
-    print(f"  {len(node_map)} nodes indexed")
-
-    # --- Stage 2: Find candidate nodes ---
-    print("\nStage 2: Finding candidate nodes...")
-    # Nodes to redact (intersect redaction polygons)
-    redact_candidates = find_candidate_nodes(rtree_idx, node_map, redaction_polys, buffer_m=50)
-    print(f"  {len(redact_candidates)} nodes intersect redaction polygons")
-
-    # Nodes to include in output (broader region for debugging)
-    region_candidates = find_region_nodes(rtree_idx, node_map, redaction_polys, buffer_m=args.buffer)
-    print(f"  {len(region_candidates)} nodes in output region (~{args.buffer}m buffer)")
-
-    # Build mapping: node_index -> resource_id
-    # resource_id is stored in the node's resourceId field, or sometimes it's derived
-    # from the node's index. Let's check what fields are available.
-    node_resource_map = {}
-    for ni in region_candidates:
-        node = node_map[ni]
-        # resourceId may or may not be present; fall back to index
-        rid = node.get("resourceId", node.get("index", ni))
-        node_resource_map[ni] = rid
-
-    # --- Stage 3 & 4: Parse geometry and redact textures ---
-    print("\nStage 3-4: Processing nodes (geometry parsing + texture redaction)...")
-    redacted_textures = {}  # resource_id -> modified JPEG bytes
-    nodes_processed = 0
-    nodes_redacted = 0
-
-    for ni in sorted(redact_candidates):
-        node = node_map[ni]
-        rid = node_resource_map.get(ni)
-        if rid is None:
-            continue
-
-        # Check if this node has geometry and texture
-        geom_path = f"nodes/{rid}/geometries/0.bin.gz"
-        tex_path = f"nodes/{rid}/textures/0.jpg"
-
-        try:
-            zf.getinfo(geom_path)
             zf.getinfo(tex_path)
+            zf.getinfo(geom_path)
         except KeyError:
             continue
 
-        nodes_processed += 1
-
-        # Read and decompress geometry
-        geom_data = gzip.decompress(zf.read(geom_path))
-        geom = parse_geometry_buffer(geom_data, has_color=has_color)
-        if geom is None:
+        result = parse_geometry(zf, res_id)
+        if result is None:
             continue
+        positions, uv0, file_vc = result
 
         obb_center = node["obb"]["center"]
+        pos_world = positions.copy()
+        pos_world[:, 0] += obb_center[0]
+        pos_world[:, 1] += obb_center[1]
+        pos_world[:, 2] += obb_center[2]
 
-        # Find triangles intersecting redaction polygons
-        redaction_tris = find_redaction_triangles(geom, obb_center, redaction_polys)
-        if not redaction_tris:
-            continue
+        num_tri = file_vc // 3
+        tri_pos = pos_world.reshape(num_tri, 3, 3)
+
+        # Vertex containment
+        vertex_inside = np.array([
+            prep_p.contains(Point(pos_world[i, 0], pos_world[i, 1]))
+            for i in range(file_vc)
+        ])
+        tri_inside = vertex_inside.reshape(num_tri, 3).sum(axis=1)
+
+        # Straddle detection for large boundary triangles
+        straddle_set = set()
+        tri_polys_2d = []
+        tri_polys_idx = []
+        for i in range(num_tri):
+            if tri_inside[i] > 0:
+                continue
+            v0, v1, v2 = tri_pos[i, 0, :2], tri_pos[i, 1, :2], tri_pos[i, 2, :2]
+            try:
+                tp = Polygon([v0, v1, v2])
+                if tp.is_valid and not tp.is_empty:
+                    tri_polys_2d.append(tp)
+                    tri_polys_idx.append(i)
+            except:
+                continue
+        if tri_polys_2d:
+            tree = STRtree(tri_polys_2d)
+            for hit_idx in tree.query(poly):
+                if poly.intersects(tri_polys_2d[hit_idx]):
+                    straddle_set.add(tri_polys_idx[hit_idx])
 
         # Load texture
         tex_data = zf.read(tex_path)
         texture = Image.open(io.BytesIO(tex_data))
         tex_w, tex_h = texture.size
+        tex_np = np.array(texture)
 
-        # Build mask
-        mask = build_redaction_mask(redaction_tris, geom["uv0"], tex_w, tex_h, dilation_px=args.dilation)
-        if mask is None:
+        # Build mask and color map simultaneously
+        mask = Image.new("L", (tex_w, tex_h), 0)
+        draw = ImageDraw.Draw(mask)
+        # Per-pixel color from voxel grid (for boundary triangles)
+        voxel_tex = np.zeros_like(tex_np, dtype=np.float64)
+        voxel_mask = np.zeros((tex_h, tex_w), dtype=np.uint8)
+
+        n_full = 0
+        n_boundary = 0
+
+        for i in range(num_tri):
+            n_in = tri_inside[i]
+            if n_in == 0 and i not in straddle_set:
+                continue
+
+            uv_a, uv_b, uv_c = uv0[3*i], uv0[3*i+1], uv0[3*i+2]
+
+            if n_in == 3:
+                # Full triangle: rasterize for mask, sample voxel at vertices
+                pts = [(uv_a[0]*tex_w, uv_a[1]*tex_h),
+                       (uv_b[0]*tex_w, uv_b[1]*tex_h),
+                       (uv_c[0]*tex_w, uv_c[1]*tex_h)]
+                draw.polygon(pts, fill=255)
+                n_full += 1
+            else:
+                n_boundary += 1
+
+            # Per-pixel: iterate UV bounding box, map to world, sample voxel
+            us = [uv_a[0], uv_b[0], uv_c[0]]
+            vs = [uv_a[1], uv_b[1], uv_c[1]]
+            px_min = max(0, int(min(us) * tex_w) - 1)
+            px_max = min(tex_w - 1, int(max(us) * tex_w) + 1)
+            py_min = max(0, int(min(vs) * tex_h) - 1)
+            py_max = min(tex_h - 1, int(max(vs) * tex_h) + 1)
+
+            wv0 = tri_pos[i, 0]  # full XYZ
+            wv1 = tri_pos[i, 1]
+            wv2 = tri_pos[i, 2]
+
+            for py in range(py_min, py_max + 1):
+                for px in range(px_min, px_max + 1):
+                    u_coord = (px + 0.5) / tex_w
+                    v_coord = (py + 0.5) / tex_h
+
+                    bu, bv, bw = _bary_uv(u_coord, v_coord, uv_a, uv_b, uv_c)
+                    if bu < -0.001 or bv < -0.001 or bw < -0.001:
+                        continue
+
+                    # World XYZ from barycentric
+                    wx = bu * wv0[0] + bv * wv1[0] + bw * wv2[0]
+                    wy = bu * wv0[1] + bv * wv1[1] + bw * wv2[1]
+                    wz = bu * wv0[2] + bv * wv1[2] + bw * wv2[2]
+
+                    # For boundary triangles, check polygon containment
+                    if n_in < 3 and not prep_p.contains(Point(wx, wy)):
+                        continue
+
+                    # Sample voxel grid
+                    gi = int((wx - grid_origin[0]) / voxel_size)
+                    gj_idx = int((wy - grid_origin[1]) / voxel_size)
+                    gk = int((wz - grid_origin[2]) / voxel_size)
+                    gi = np.clip(gi, 0, grid_size[0] - 1)
+                    gj_idx = np.clip(gj_idx, 0, grid_size[1] - 1)
+                    gk = np.clip(gk, 0, grid_size[2] - 1)
+
+                    voxel_tex[py, px] = blurred_color[gi, gj_idx, gk]
+                    voxel_mask[py, px] = 255
+
+        # Merge: full-triangle mask + per-pixel boundary mask
+        mask_np = np.maximum(np.array(mask), voxel_mask)
+
+        if np.sum(mask_np > 0) == 0:
             continue
 
-        # Apply pixelate + blur
-        result = apply_pixelate_blur(texture, mask, args.pixelate_factor, args.blur_radius)
-
-        # Save to buffer
-        buf = io.BytesIO()
-        result.save(buf, format="JPEG", quality=85)
-        redacted_textures[rid] = buf.getvalue()
-        nodes_redacted += 1
-
-        if nodes_redacted % 50 == 0:
-            print(f"  Redacted {nodes_redacted} nodes so far...")
-
-    print(f"  Processed {nodes_processed} nodes, redacted {nodes_redacted} textures")
-
-    # --- Stage 5: Validate ---
-    print("\nStage 5: Validating...")
-    for rid, tex_bytes in redacted_textures.items():
-        img = Image.open(io.BytesIO(tex_bytes))
-        orig_data = zf.read(f"nodes/{rid}/textures/0.jpg")
-        orig = Image.open(io.BytesIO(orig_data))
-        if img.size != orig.size:
-            print(f"  WARNING: Texture size mismatch for node {rid}: {img.size} vs {orig.size}")
-    print(f"  {len(redacted_textures)} textures validated")
-
-    # --- Stage 6: Repack (region-only output) ---
-    print(f"\nStage 6: Repacking region to {args.output}...")
-
-    # Determine which ZIP entries to include in the output
-    # Include: metadata files + all entries for nodes in the region
-    region_rids = set()
-    for ni in region_candidates:
-        rid = node_resource_map.get(ni)
-        if rid is not None:
-            region_rids.add(str(rid))
-
-    entries_to_copy = []
-    for name in zf.namelist():
-        if name.startswith("nodes/"):
-            parts = name.split("/")
-            if len(parts) >= 2 and parts[1] in region_rids:
-                entries_to_copy.append(name)
-        elif name.startswith("@"):
-            # Skip hash index, we'll regenerate
-            continue
-        else:
-            # Include all non-node files (metadata, nodepages, etc.)
-            entries_to_copy.append(name)
-
-    print(f"  {len(entries_to_copy)} entries to include in output")
-
-    # Write output SLPK
-    offsets = {}
-    sizes = {}
-    internal_paths = []
-
-    with zipfile.ZipFile(args.output, "w", zipfile.ZIP_STORED) as out_zf:
-        for entry_name in entries_to_copy:
-            # Check if this is a redacted texture
-            if entry_name.startswith("nodes/") and entry_name.endswith("/textures/0.jpg"):
-                rid_str = entry_name.split("/")[1]
-                rid_key = int(rid_str) if rid_str.isdigit() else rid_str
-                if rid_key in redacted_textures:
-                    out_zf.writestr(entry_name, redacted_textures[rid_key])
-                    internal_paths.append(entry_name)
+        # For full triangles that weren't per-pixel sampled, fill from voxel grid
+        # using vertex-averaged voxel color (fast approximation)
+        full_only = (np.array(mask) > 0) & (voxel_mask == 0)
+        if np.sum(full_only) > 0:
+            # These pixels need voxel colors but weren't individually sampled.
+            # Sample at triangle centroids for each full triangle and flood fill.
+            # Simpler: iterate full triangles' pixels (already done for boundary,
+            # skip for full to save time — but now we need them).
+            # Re-iterate full triangles for voxel sampling.
+            for i in range(num_tri):
+                if tri_inside[i] != 3:
                     continue
+                uv_a, uv_b, uv_c = uv0[3*i], uv0[3*i+1], uv0[3*i+2]
+                wv0 = tri_pos[i, 0]
+                wv1 = tri_pos[i, 1]
+                wv2 = tri_pos[i, 2]
 
-            # Copy original entry
-            data = zf.read(entry_name)
-            out_zf.writestr(entry_name, data)
-            internal_paths.append(entry_name)
+                us = [uv_a[0], uv_b[0], uv_c[0]]
+                vs_list = [uv_a[1], uv_b[1], uv_c[1]]
+                px_min = max(0, int(min(us) * tex_w) - 1)
+                px_max = min(tex_w - 1, int(max(us) * tex_w) + 1)
+                py_min = max(0, int(min(vs_list) * tex_h) - 1)
+                py_max = min(tex_h - 1, int(max(vs_list) * tex_h) + 1)
 
-        # Regenerate hash index
-        # We need to get the offsets after writing, but zipfile doesn't expose this easily
-        # during writing. We'll add the hash index entry but skip regeneration for now
-        # since this is a debug output.
+                for py in range(py_min, py_max + 1):
+                    for px in range(px_min, px_max + 1):
+                        if voxel_mask[py, px] > 0:
+                            continue  # already sampled
+                        if mask_np[py, px] == 0:
+                            continue  # not in mask
 
-    print(f"  Output written to {args.output}")
+                        u_coord = (px + 0.5) / tex_w
+                        v_coord = (py + 0.5) / tex_h
+                        bu, bv, bw = _bary_uv(u_coord, v_coord, uv_a, uv_b, uv_c)
+                        if bu < -0.001 or bv < -0.001 or bw < -0.001:
+                            continue
 
+                        wx = bu * wv0[0] + bv * wv1[0] + bw * wv2[0]
+                        wy = bu * wv0[1] + bv * wv1[1] + bw * wv2[1]
+                        wz = bu * wv0[2] + bv * wv1[2] + bw * wv2[2]
+
+                        gi = np.clip(int((wx - grid_origin[0]) / voxel_size), 0, grid_size[0]-1)
+                        gj_idx = np.clip(int((wy - grid_origin[1]) / voxel_size), 0, grid_size[1]-1)
+                        gk = np.clip(int((wz - grid_origin[2]) / voxel_size), 0, grid_size[2]-1)
+
+                        voxel_tex[py, px] = blurred_color[gi, gj_idx, gk]
+                        voxel_mask[py, px] = 255
+
+        # UV padding: extend into dead space
+        all_tri_mask = Image.new("L", (tex_w, tex_h), 0)
+        all_tri_draw = ImageDraw.Draw(all_tri_mask)
+        for ti in range(num_tri):
+            a, b, c = uv0[3*ti], uv0[3*ti+1], uv0[3*ti+2]
+            pts = [(a[0]*tex_w, a[1]*tex_h), (b[0]*tex_w, b[1]*tex_h), (c[0]*tex_w, c[1]*tex_h)]
+            all_tri_draw.polygon(pts, fill=255)
+        dead_space = np.array(all_tri_mask) == 0
+
+        padded = binary_dilation(mask_np > 0, iterations=4).astype(np.uint8) * 255
+        padded[~dead_space & (mask_np == 0)] = 0
+        # For padded pixels, copy nearest voxel color
+        pad_only = (padded > 0) & (voxel_mask == 0)
+        if np.sum(pad_only) > 0:
+            # Simple: dilate the voxel color image to fill padding
+            for c in range(3):
+                chan = voxel_tex[:, :, c].copy()
+                for _ in range(4):
+                    filled = gaussian_filter(chan * (voxel_mask > 0).astype(float), sigma=1)
+                    weight_f = gaussian_filter((voxel_mask > 0).astype(float), sigma=1)
+                    weight_f = np.maximum(weight_f, 1e-10)
+                    chan = np.where(voxel_mask > 0, chan, filled / weight_f)
+                voxel_tex[:, :, c] = chan
+
+        mask_np = np.maximum(mask_np, padded)
+
+        # Composite
+        mask_bool = mask_np > 0
+        tex_np[mask_bool] = np.clip(voxel_tex[mask_bool], 0, 255).astype(np.uint8)
+        result = Image.fromarray(tex_np)
+
+        buf = io.BytesIO()
+        result.save(buf, format="JPEG", quality=100, subsampling=0)
+        red_bytes = buf.getvalue()
+        replace_paths[tex_path] = red_bytes
+
+        # Update sharedResource
+        shared_path = f"nodes/{res_id}/shared/sharedResource.json.gz"
+        try:
+            shared = json.loads(gzip.decompress(zf.read(shared_path)))
+            for td in shared.get("textureDefinitions", {}).values():
+                for img in td.get("images", []):
+                    img["length"] = [len(red_bytes)]
+            replace_paths[shared_path] = gzip.compress(json.dumps(shared).encode("utf-8"))
+        except:
+            pass
+
+        redacted += 1
+
+    print(f"Redacted {redacted} textures")
+    print(f"Total replace paths: {len(replace_paths)}")
+
+    # === REBUILD (identical to test_all_red.py) ===
+    print(f"\nRebuilding to {args.output}...")
+    raw_fp = open(args.slpk, "rb")
+    entry_count = 0
+    replaced = 0
+
+    with zipfile.ZipFile(args.output, "w", zipfile.ZIP_STORED, allowZip64=True) as outz:
+        for item in zf.infolist():
+            if item.filename.startswith("@"):
+                continue
+            if item.filename in replace_paths:
+                new_info = zipfile.ZipInfo(item.filename)
+                new_info.compress_type = zipfile.ZIP_STORED
+                outz.writestr(new_info, replace_paths[item.filename])
+                replaced += 1
+            else:
+                raw_fp.seek(item.header_offset)
+                lfh = raw_fp.read(30)
+                fname_len = struct.unpack_from("<H", lfh, 26)[0]
+                extra_len = struct.unpack_from("<H", lfh, 28)[0]
+                data_offset = item.header_offset + 30 + fname_len + extra_len
+                raw_fp.seek(data_offset)
+                raw_data = raw_fp.read(item.compress_size)
+                item.compress_type = zipfile.ZIP_STORED
+                outz.writestr(item, raw_data)
+            entry_count += 1
+            if entry_count % 100000 == 0:
+                print(f"  {entry_count} entries...")
+
+    raw_fp.close()
     zf.close()
+    print(f"  {entry_count} entries, {replaced} replaced")
 
-    # Report file size
+    # Hash table
+    print("  Regenerating hash table...")
+    hash_entries = []
+    with zipfile.ZipFile(args.output, "r") as outz:
+        for item in outz.infolist():
+            canonical = item.filename.lower().replace("\\", "/")
+            if canonical.startswith("/"):
+                canonical = canonical[1:]
+            md5 = hashlib.md5(canonical.encode("utf-8")).digest()
+            hash_entries.append((md5, struct.pack("<Q", item.header_offset)))
+    hash_entries.sort(key=lambda e: (
+        struct.unpack("<Q", e[0][:8])[0],
+        struct.unpack("<Q", e[0][8:])[0],
+    ))
+    hash_data = b"".join(h + o for h, o in hash_entries)
+    with zipfile.ZipFile(args.output, "a", allowZip64=True) as outz:
+        outz.writestr("@3dtilesIndex1@", hash_data)
+
+    print(f"  Hash table: {len(hash_entries)} entries")
     out_size = Path(args.output).stat().st_size
-    print(f"  Output size: {out_size / 1024 / 1024:.1f} MB")
-    print("\nDone!")
+    print(f"\nOutput: {args.output} ({out_size / 1024**3:.1f} GB)")
+    print("Done!")
 
 
 if __name__ == "__main__":

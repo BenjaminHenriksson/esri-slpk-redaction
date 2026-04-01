@@ -11,4 +11,8 @@ wheels/
 
 # Large data files
 *.slpk
+
+# Debug artifacts
 debug_textures/
+debug_uv/
+__pycache__/
