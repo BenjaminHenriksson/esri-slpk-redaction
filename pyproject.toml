@@ -1,8 +1,12 @@
 [project]
-name = "mesh-redaction"
+name = "esri-slpk-redaction"
 version = "0.1.0"
-description = "Add your description here"
+description = "Blur regions of an Esri SLPK 3D mesh that fall inside a geographic polygon."
 readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Benjamin Henriksson", email = "abenjaminhenriksson@gmail.com" },
+]
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.4.3",
@@ -12,3 +16,6 @@ dependencies = [
     "scipy>=1.17.1",
     "shapely>=2.1.2",
 ]
+
+[project.urls]
+Repository = "https://github.com/BenjaminHenriksson/esri-slpk-redaction"

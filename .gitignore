@@ -12,6 +12,9 @@ wheels/
 # Large data files
 *.slpk
 
+# GeoJSON inputs (may contain sensitive locations)
+*.geojson
+
 # Debug artifacts
 debug_textures/
 debug_uv/

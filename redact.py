@@ -69,6 +69,7 @@ def main():
     parser.add_argument("--slpk", required=True, help="Input SLPK file")
     parser.add_argument("--polygons", required=True, help="GeoJSON redaction polygons")
     parser.add_argument("--output", required=True, help="Output SLPK file")
+    parser.add_argument("--crs", default="EPSG:3011", help="CRS of SLPK vertex coordinates (default: EPSG:3011)")
     parser.add_argument("--voxel-size", type=float, default=DEFAULT_VOXEL_SIZE, help="Voxel size in meters (default: 2.0)")
     parser.add_argument("--blur-sigma", type=float, default=DEFAULT_BLUR_SIGMA, help="Blur sigma in voxel cells (default: 1.5)")
     args = parser.parse_args()
@@ -82,7 +83,7 @@ def main():
     zf = zipfile.ZipFile(args.slpk, "r")
 
     # Load polygon
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3011", always_xy=True)
+    transformer = Transformer.from_crs("EPSG:4326", args.crs, always_xy=True)
     with open(args.polygons) as f:
         gj = json.load(f)
     geom = shape(gj["features"][0]["geometry"])
