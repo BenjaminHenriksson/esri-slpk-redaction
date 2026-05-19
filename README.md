@@ -24,7 +24,7 @@ uv run python redact.py \
     --crs EPSG:3011
 ```
 
-`--polygons` is a GeoJSON file in EPSG:4326. The first feature's polygon is used. `--crs` is the projected CRS the SLPK's vertex positions live in; default is EPSG:3011 (SWEREF99 18 00).
+`--polygons` is a GeoJSON file in EPSG:4326 (FeatureCollection, single Feature, or bare Geometry). All features are unioned into a single redaction mask. Polygons, MultiPolygons, and holes are all supported. Features outside the mesh are silently ignored. `--crs` is the projected CRS the SLPK's vertex positions live in; default is EPSG:3011 (SWEREF99 18 00).
 
 ### Arguments
 
@@ -51,7 +51,7 @@ Repacking writes modified JPEGs in place, leaves every other entry byte-for-byte
 
 - No Draco-compressed geometry.
 - No KTX2/Basis-compressed textures.
-- Only the first polygon feature is read.
+- Each polygon gets its own voxel grid; dispersed polygons scale linearly, not by bounding-box area.
 - No tests, no CI.
 
 ## License

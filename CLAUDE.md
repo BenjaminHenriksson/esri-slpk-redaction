@@ -53,5 +53,5 @@ Key design choices:
 
 - `redact.py` — Entire pipeline implementation (~510 lines).
 - `plan.md` — Original architecture plan with edge cases and future work.
-- `region.geojson` — Sample redaction polygon in Stockholm for testing.
+- Input GeoJSON can be a FeatureCollection, single Feature, or bare Geometry. All features are unioned.
 - `pyproject.toml` — Dependencies managed via `uv`; Python ≥3.12.
