@@ -20,14 +20,15 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from pyproj import Transformer
-from scipy.ndimage import binary_dilation, gaussian_filter
+from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter
 from shapely.geometry import Polygon, Point, box, shape
 from shapely.ops import transform as shapely_transform, unary_union
 from shapely.prepared import prep
 from shapely.strtree import STRtree
 
-DEFAULT_VOXEL_SIZE = 2.0  # meters per voxel cell
-DEFAULT_BLUR_SIGMA = 1.5  # voxel cells
+DEFAULT_VOXEL_SIZE = 1.5  # meters per voxel cell
+DEFAULT_BLUR_SIGMA = 0.5  # voxel cells (1.5 x 0.5 = 0.75 m physical blur radius)
+BLACK_THRESHOLD = 3  # max channel value treated as an unfilled (black) painted pixel
 
 
 def _bary_uv(px, py, uv_a, uv_b, uv_c):
@@ -45,9 +46,27 @@ def _bary_uv(px, py, uv_a, uv_b, uv_c):
     return 1-v-w, v, w
 
 
-def parse_geometry(zf, res_id):
+def raw_entry_read(zf, raw_fp, name):
+    """Read a stored (uncompressed) zip entry directly via its raw file offset.
+
+    zipfile.ZipFile.read() can raise OSError [Errno 22] on Windows for entries
+    located past the 4GB mark in archives larger than 4GB. SLPK entries are
+    always stored uncompressed, so reading the raw bytes directly (same trick
+    used when rebuilding the output archive below) sidesteps that entirely.
+    """
+    info = zf.getinfo(name)
+    raw_fp.seek(info.header_offset)
+    lfh = raw_fp.read(30)
+    fname_len = struct.unpack_from("<H", lfh, 26)[0]
+    extra_len = struct.unpack_from("<H", lfh, 28)[0]
+    data_offset = info.header_offset + 30 + fname_len + extra_len
+    raw_fp.seek(data_offset)
+    return raw_fp.read(info.compress_size)
+
+
+def parse_geometry(zf, raw_fp, res_id):
     """Parse geometry buffer, return (positions, uv0, file_vc) or None."""
-    gdata = gzip.decompress(zf.read(f"nodes/{res_id}/geometries/0.bin.gz"))
+    gdata = gzip.decompress(raw_entry_read(zf, raw_fp, f"nodes/{res_id}/geometries/0.bin.gz"))
     if len(gdata) < 8:
         return None
     file_vc = struct.unpack_from("<I", gdata, 0)[0]
@@ -72,8 +91,8 @@ def main():
     parser.add_argument("--polygons", required=True, help="GeoJSON redaction polygons")
     parser.add_argument("--output", required=True, help="Output SLPK file")
     parser.add_argument("--crs", default="EPSG:3011", help="CRS of SLPK vertex coordinates (default: EPSG:3011)")
-    parser.add_argument("--voxel-size", type=float, default=DEFAULT_VOXEL_SIZE, help="Voxel size in meters (default: 2.0)")
-    parser.add_argument("--blur-sigma", type=float, default=DEFAULT_BLUR_SIGMA, help="Blur sigma in voxel cells (default: 1.5)")
+    parser.add_argument("--voxel-size", type=float, default=DEFAULT_VOXEL_SIZE, help=f"Voxel size in meters (default: {DEFAULT_VOXEL_SIZE})")
+    parser.add_argument("--blur-sigma", type=float, default=DEFAULT_BLUR_SIGMA, help=f"Blur sigma in voxel cells (default: {DEFAULT_BLUR_SIGMA})")
     args = parser.parse_args()
 
     voxel_size = args.voxel_size
@@ -83,6 +102,7 @@ def main():
 
     zipfile.ZipExtFile._update_crc = lambda self, data: None
     zf = zipfile.ZipFile(args.slpk, "r")
+    raw_fp = open(args.slpk, "rb")
 
     # Load and project all redaction polygons
     transformer = Transformer.from_crs("EPSG:4326", args.crs, always_xy=True)
@@ -102,25 +122,31 @@ def main():
         geom = shape(feat["geometry"])
         if geom.is_empty:
             continue
-        projected.append(shapely_transform(transformer.transform, geom))
+        feat_id = feat.get("properties", {}).get("ID")
+        projected.append((feat_id, shapely_transform(transformer.transform, geom)))
 
     if not projected:
         print("No valid geometries in GeoJSON — copying input unchanged.")
         zf.close()
+        raw_fp.close()
         shutil.copy2(args.slpk, args.output)
         return
 
     # Decompose into individual simple polygons (flatten MultiPolygons)
     individual_polys = []
-    for geom in projected:
+    individual_ids = []
+    for feat_id, geom in projected:
         if geom.geom_type == 'Polygon':
             individual_polys.append(geom)
+            individual_ids.append(feat_id)
         elif geom.geom_type == 'MultiPolygon':
             individual_polys.extend(geom.geoms)
+            individual_ids.extend([feat_id] * len(geom.geoms))
 
     if not individual_polys:
         print("No polygon geometries found — copying input unchanged.")
         zf.close()
+        raw_fp.close()
         shutil.copy2(args.slpk, args.output)
         return
 
@@ -152,6 +178,7 @@ def main():
     if not candidates:
         print("No mesh nodes intersect the redaction polygon(s) — copying input unchanged.")
         zf.close()
+        raw_fp.close()
         shutil.copy2(args.slpk, args.output)
         return
 
@@ -164,8 +191,8 @@ def main():
 
     for pi, single_poly in enumerate(individual_polys):
         prep_single = prep(single_poly)
-        if len(individual_polys) > 1:
-            print(f"\n--- Polygon {pi+1}/{len(individual_polys)} ---")
+        poly_id = individual_ids[pi]
+        print(f"\n--- Polygon {pi+1}/{len(individual_polys)} (ID={poly_id}) ---")
 
         # Find candidates for this specific polygon
         poly_candidates = []
@@ -188,7 +215,7 @@ def main():
         z_min, z_max = 1e9, -1e9
         for node, _ in poly_leaves:
             res_id = node["mesh"]["material"]["resource"]
-            result = parse_geometry(zf, res_id)
+            result = parse_geometry(zf, raw_fp, res_id)
             if result is None:
                 continue
             positions, _, _ = result
@@ -212,9 +239,10 @@ def main():
         color_sum = np.zeros((*grid_size, 3), dtype=np.float64)
         color_count = np.zeros(grid_size, dtype=np.int32)
 
-        for node, _ in poly_leaves:
+        num_poly_leaves = len(poly_leaves)
+        for leaf_idx, (node, _) in enumerate(poly_leaves):
             res_id = node["mesh"]["material"]["resource"]
-            result = parse_geometry(zf, res_id)
+            result = parse_geometry(zf, raw_fp, res_id)
             if result is None:
                 continue
             positions, uv0, file_vc = result
@@ -225,7 +253,8 @@ def main():
             pos_world[:, 1] += obb_center[1]
             pos_world[:, 2] += obb_center[2]
 
-            tex_data = zf.read(f"nodes/{res_id}/textures/0.jpg")
+            print(f"    [poly ID={poly_id}] leaf {leaf_idx}/{num_poly_leaves} res_id={res_id} reading texture...", flush=True)
+            tex_data = raw_entry_read(zf, raw_fp, f"nodes/{res_id}/textures/0.jpg")
             tex = Image.open(io.BytesIO(tex_data))
             tex_np = np.array(tex)
             tw, th = tex.size
@@ -249,7 +278,7 @@ def main():
         print(f"    Occupied voxels: {np.sum(occupied)} ({100*np.sum(occupied)/np.prod(grid_size):.2f}%)")
         voxel_color = np.zeros_like(color_sum)
         for c in range(3):
-            voxel_color[:, :, :, c] = np.where(occupied, color_sum[:, :, :, c] / color_count, 0)
+            np.divide(color_sum[:, :, :, c], color_count, out=voxel_color[:, :, :, c], where=occupied)
 
         # === PHASE 2: Blur voxel grid ===
         print("  Phase 2: Blurring voxel grid...")
@@ -267,11 +296,13 @@ def main():
         seen = set()
         redacted = 0
 
-        for node, is_leaf in poly_candidates:
+        num_poly_candidates = len(poly_candidates)
+        for cand_idx, (node, is_leaf) in enumerate(poly_candidates):
             res_id = node["mesh"]["material"]["resource"]
             if res_id in seen:
                 continue
             seen.add(res_id)
+            print(f"    [poly ID={poly_id}] candidate {cand_idx}/{num_poly_candidates} res_id={res_id}", flush=True)
 
             tex_path = f"nodes/{res_id}/textures/0.jpg"
             geom_path = f"nodes/{res_id}/geometries/0.bin.gz"
@@ -281,7 +312,7 @@ def main():
             except KeyError:
                 continue
 
-            result = parse_geometry(zf, res_id)
+            result = parse_geometry(zf, raw_fp, res_id)
             if result is None:
                 continue
             positions, uv0, file_vc = result
@@ -325,7 +356,7 @@ def main():
             if tex_path in replace_paths:
                 texture = Image.open(io.BytesIO(replace_paths[tex_path]))
             else:
-                tex_data = zf.read(tex_path)
+                tex_data = raw_entry_read(zf, raw_fp, tex_path)
                 texture = Image.open(io.BytesIO(tex_data))
             tex_w, tex_h = texture.size
             tex_np = np.array(texture)
@@ -434,18 +465,57 @@ def main():
             padded[~dead_space & (mask_np == 0)] = 0
             pad_only = (padded > 0) & (voxel_mask == 0)
             if np.sum(pad_only) > 0:
+                painted = voxel_mask > 0
+                k0 = painted.astype(np.float64)
+                w0 = gaussian_filter(k0, sigma=1)
+                reached = w0 >= 1e-10  # what one blur pass can actually support
+
                 for c in range(3):
-                    chan = voxel_tex[:, :, c].copy()
-                    for _ in range(4):
-                        filled = gaussian_filter(chan * (voxel_mask > 0).astype(float), sigma=1)
-                        weight_f = gaussian_filter((voxel_mask > 0).astype(float), sigma=1)
-                        weight_f = np.maximum(weight_f, 1e-10)
-                        chan = np.where(voxel_mask > 0, chan, filled / weight_f)
-                    voxel_tex[:, :, c] = chan
+                    filled = gaussian_filter(voxel_tex[:, :, c] * k0, sigma=1)
+                    voxel_tex[:, :, c] = np.where(
+                        ~painted & reached, filled / np.maximum(w0, 1e-10), voxel_tex[:, :, c]
+                    )
+
+                # Padding dilates up to ~5.7px diagonally, but a sigma=1 blur is
+                # truncated at 4px, so pixels past that got weight 0 and resolved to
+                # 0/1e-10 = black. Grow the known set outward one ring per pass to
+                # reach them — the source set has to expand, otherwise every pass
+                # re-derives from the same pixels and never gets further out.
+                known = painted | reached
+                for _ in range(16):
+                    if known[pad_only].all():
+                        break
+                    kf = known.astype(np.float64)
+                    w = gaussian_filter(kf, sigma=1)
+                    newly = (w > 0.02) & ~known
+                    if not np.any(newly):
+                        break
+                    for c in range(3):
+                        filled = gaussian_filter(voxel_tex[:, :, c] * kf, sigma=1)
+                        voxel_tex[:, :, c] = np.where(
+                            newly, filled / np.maximum(w, 1e-10), voxel_tex[:, :, c]
+                        )
+                    known |= newly
 
             mask_np = np.maximum(mask_np, padded)
 
             mask_bool = mask_np > 0
+
+            # Pixels the diffusion could not reach have no coloured neighbour to spread
+            # from (a UV island whose triangles never got painted, plus its padding), so
+            # they are still 0 and would write as pure black. Copy the colour of the
+            # nearest redacted non-black pixel instead. Sources are restricted to the
+            # redacted area, so no original imagery is pulled in, and the copy is
+            # un-smoothed so it cannot flatten anything around it.
+            still_black = mask_bool & np.all(np.clip(voxel_tex, 0, 255) <= BLACK_THRESHOLD, axis=-1)
+            source = mask_bool & ~still_black
+            if np.any(still_black) and np.any(source):
+                _, nidx = distance_transform_edt(~source, return_distances=True, return_indices=True)
+                nidx = tuple(nidx)
+                for c in range(3):
+                    chan = voxel_tex[:, :, c]
+                    voxel_tex[:, :, c] = np.where(still_black, chan[nidx], chan)
+
             tex_np[mask_bool] = np.clip(voxel_tex[mask_bool], 0, 255).astype(np.uint8)
             result = Image.fromarray(tex_np)
 
@@ -467,15 +537,14 @@ def main():
             redacted += 1
 
         total_redacted += redacted
-        if len(individual_polys) > 1:
-            print(f"  Redacted {redacted} textures for this polygon")
+        print(f"  Redacted {redacted} textures for polygon ID={poly_id}")
 
     print(f"\nRedacted {total_redacted} textures total")
     print(f"Total replace paths: {len(replace_paths)}")
 
     # === REBUILD (identical to test_all_red.py) ===
     print(f"\nRebuilding to {args.output}...")
-    raw_fp = open(args.slpk, "rb")
+    raw_fp.seek(0)
     entry_count = 0
     replaced = 0
 
